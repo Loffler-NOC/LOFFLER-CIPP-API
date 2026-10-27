@@ -89,9 +89,13 @@ function Invoke-CIPPRestMethod {
     )
 
     # ------------------------------------------------------------------
-    # Escape hatch — env var kill switch or per-call legacy switch
+    # Escape hatch — env var kill switch, missing pooled client type,
+    # per-call legacy switch, or binary body (byte[] cannot be
+    # serialised to string for the pooled C# client)
     # ------------------------------------------------------------------
-    if ($UseLegacyInvokeRestMethod -or $env:DisableCIPPRestMethod -eq 'true') {
+    $HasCippRestClient = $null -ne ('CIPP.CIPPRestClient' -as [type])
+    $IsBinaryBody = $Body -is [byte[]]
+    if ($UseLegacyInvokeRestMethod -or [System.Environment]::GetEnvironmentVariable('DisableCIPPRestMethod') -eq 'true' -or -not $HasCippRestClient -or $IsBinaryBody) {
         $LegacyParams = @{
             Uri         = $Uri
             Method      = $Method
@@ -172,22 +176,41 @@ function Invoke-CIPPRestMethod {
             $TimeoutSec,
             $MaximumRedirection
         )
-    } catch [System.Net.Http.HttpRequestException] {
+    } catch {
+        # PowerShell wraps .NET static method exceptions in MethodInvocationException.
+        # The actual HttpRequestException / OperationCanceledException is the InnerException.
+        $InnerEx = $_.Exception.InnerException ?? $_.Exception
+
+        if ($InnerEx -is [System.OperationCanceledException]) {
+            $PSCmdlet.ThrowTerminatingError(
+                [System.Management.Automation.ErrorRecord]::new(
+                    [System.TimeoutException]::new("The request to '$Uri' timed out after ${TimeoutSec}s.", $InnerEx),
+                    'RequestTimeout',
+                    [System.Management.Automation.ErrorCategory]::OperationTimeout,
+                    $Uri
+                )
+            )
+            return
+        }
+
+        if ($InnerEx -is [System.Net.Http.HttpRequestException]) {
+            $PSCmdlet.ThrowTerminatingError(
+                [System.Management.Automation.ErrorRecord]::new(
+                    $InnerEx,
+                    'HttpRequestFailed',
+                    [System.Management.Automation.ErrorCategory]::ConnectionError,
+                    $Uri
+                )
+            )
+            return
+        }
+
+        # Unknown exception type — re-throw with the inner exception for a cleaner message
         $PSCmdlet.ThrowTerminatingError(
             [System.Management.Automation.ErrorRecord]::new(
-                $_.Exception,
+                $InnerEx,
                 'HttpRequestFailed',
                 [System.Management.Automation.ErrorCategory]::ConnectionError,
-                $Uri
-            )
-        )
-        return
-    } catch [System.OperationCanceledException] {
-        $PSCmdlet.ThrowTerminatingError(
-            [System.Management.Automation.ErrorRecord]::new(
-                [System.TimeoutException]::new("The request to '$Uri' timed out after ${TimeoutSec}s."),
-                'RequestTimeout',
-                [System.Management.Automation.ErrorCategory]::OperationTimeout,
                 $Uri
             )
         )
@@ -220,7 +243,7 @@ function Invoke-CIPPRestMethod {
     # ------------------------------------------------------------------
     if (-not $SkipHttpErrorCheck -and -not $Result.IsSuccess) {
         $ErrorMessage = "Response status code does not indicate success: $($Result.StatusCode)"
-        $Exception = [System.Net.Http.HttpRequestException]::new($ErrorMessage)
+        $Exception = [CIPP.CIPPHttpRequestException]::new($ErrorMessage, [int]$Result.StatusCode, $Result.ResponseHeaders, $Result.Content)
         $ErrorRecord = [System.Management.Automation.ErrorRecord]::new($Exception, 'WebCmdletWebResponseException', [System.Management.Automation.ErrorCategory]::InvalidOperation, $Uri)
         if (-not [string]::IsNullOrWhiteSpace($Result.Content)) {
             $ErrorRecord.ErrorDetails = [System.Management.Automation.ErrorDetails]::new($Result.Content)
@@ -233,13 +256,13 @@ function Invoke-CIPPRestMethod {
     # Return — deserialize JSON or return raw string
     # Empty body → null (matches Invoke-RestMethod on 204 No Content etc.)
     # ------------------------------------------------------------------
-    if ([string]::IsNullOrWhiteSpace($Result.Content)) {
+    if (-not $Result.HasContent) {
         return $null
     }
 
     if ($Result.IsJson) {
         try {
-            return $Result.Content | ConvertFrom-Json -Depth 100
+            return [CIPP.CippJson]::ConvertFromResponse($Result)
         } catch {
             # Malformed JSON — return raw so callers can handle it
             return $Result.Content
